@@ -1,14 +1,8 @@
-#![allow(unused_imports, dead_code)]
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use async_recursion::async_recursion;
-use log::{debug, warn};
-use std::ffi::OsString;
-use std::fs;
-use std::future::Future;
-use std::os::windows::fs::MetadataExt;
+use log::debug;
 use std::path::PathBuf;
-use std::pin::Pin;
-use tokio::fs::{read_dir, DirEntry};
+use tokio::fs::read_dir;
 
 const M_SIZE: u64 = 1024 * 1024;
 const G_SIZE: u64 = 1024 * 1024 * 1024;
@@ -16,72 +10,58 @@ const G_SIZE: u64 = 1024 * 1024 * 1024;
 #[tokio::main]
 async fn main() -> Result<()> {
     custom_utils::logger::logger_stdout_debug();
-    // let path_str = r"C:\";
-    // if path_str.contains("$RECYCLE.BIN") {
-    //     bail!("********");
-    // }
     let (path_str, size) = match_command();
-    let dir = init_dir_v2(path_str.into()).await?;
-    // let path = PathBuf::from(path_str);
-    // // let path = PathBuf::from(r"D:\$RECYCLE.BIN\S-1-5-18").canonicalize().context(anyhow!("获取[{:?}]绝对路径失败", path_str))?;
-    // // println!("start to collect {:?}", path);
-    // // let path = PathBuf::from("../");
-    // let metadata = path.metadata().context(anyhow!("获取[{:?}]metadata失败", path))?;
-    // if metadata.is_file() {
-    //     bail!("{:?} is a file not dir", path);
-    // }
-    // let name = path.file_name().unwrap_or_else(|| path.as_os_str()).to_os_string();
-    // let dir = Dir:: new(
-    //     name,
-    //     path.clone());
-    // let dir = init_dir(dir).await?;
-    // dir.size = dir.size / 1024 / 1024;
-    // debug!("{:?}", dir);
-    debug!("colleted! start to filter");
-    filter(&dir, size);
+    let dir = init_dir(path_str.into()).await?;
+    debug!("collected! start to filter");
+    let mut results = Vec::new();
+    filter(&dir, size, &mut results);
+    results.sort_by(|a, b| b.1.cmp(&a.1));
+    for (path, s) in &results {
+        println!("{}'s size: {}", path, format_size(*s));
+    }
     Ok(())
 }
 
 fn format_size(size: u64) -> String {
-    const M_SIZE: u64 = 1024 * 1024;
-    const G_SIZE: u64 = 1024 * 1024 * 1024;
     if size >= G_SIZE {
-        format!("{}g", size / G_SIZE)
+        format!("{:.2}g", size as f64 / G_SIZE as f64)
     } else if size >= M_SIZE {
-        format!("{}m", size / M_SIZE)
+        format!("{:.2}m", size as f64 / M_SIZE as f64)
     } else {
         format!("{}b", size)
     }
 }
 
-fn filter(dir: &Dir, size: u64) -> bool {
+fn filter(dir: &Dir, size: u64, results: &mut Vec<(String, u64)>) -> bool {
     if dir.g_size < size {
         return false;
     }
     let mut is_filter = false;
     for sub in dir.dirs.iter() {
-        if filter(sub, size) {
+        if filter(sub, size, results) {
             is_filter = true;
         }
     }
-    if is_filter == false {
-        debug!("{}'s size: {}", dir.path.display(), format_size(dir.size));
+    if !is_filter {
+        results.push((dir.path.display().to_string(), dir.size));
     }
-    return true;
+    true
 }
 
 use clap::{Arg, Command};
 fn match_command() -> (PathBuf, u64) {
-    let matches = Command::new("pacman")
+    let matches = Command::new("collect-filter-folders")
         .arg(
             Arg::new("path")
                 .short('p')
+                .help("扫描的目录路径")
                 .default_value(".")
                 .takes_value(true),
         )
         .arg(
             Arg::new("size")
                 .short('s')
+                .help("过滤阈值(GB)")
                 .default_value("5")
                 .takes_value(true),
         )
@@ -91,42 +71,22 @@ fn match_command() -> (PathBuf, u64) {
     (path, size)
 }
 
-#[async_recursion]
-async fn init_dir(mut dir: Dir) -> Result<Dir> {
-    let path = dir.path.clone();
-    let mut read_dir = read_dir(path.as_path())
-        .await
-        .context(anyhow!("读取文件夹[{:?}]失败", path.as_path()))?;
-    let mut dir_res = Vec::default();
-    while let Ok(Some(sub_dir)) = read_dir.next_entry().await {
-        // println!("{:?} {} {:?}", sub_dir.file_name(), sub_dir.metadata().await?.is_dir(), sub_dir.path());
-        if let Ok(metadata) = sub_dir.metadata().await {
-            if metadata.is_file() {
-                dir.size += metadata.len();
-                // dir.files.push(File {
-                //     name: sub_dir.file_name(), path: sub_dir.path(), size: metadata.len()
-                // })
-            } else if metadata.is_dir() {
-                let sub_dir = Dir::new(sub_dir.file_name(), sub_dir.path());
-                dir_res.push(tokio::spawn(async move { init_dir(sub_dir).await }));
-            }
-        } else {
-            warn!("读取文件[{}]metadata失败", sub_dir.path().display());
-        }
-    }
-    for sub_res in dir_res.into_iter() {
-        let res = sub_res.await.context(anyhow!("等待异常"))??;
-        if res.size > 0 {
-            dir.add_size(res.size);
-            dir.dirs.push(res);
-        }
-    }
-    Ok(dir)
+const SKIP_DIRS: &[&str] = &[
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "Recovery",
+    "$WinREAgent",
+];
+
+fn should_skip(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| SKIP_DIRS.iter().any(|s| n.eq_ignore_ascii_case(s)))
+        .unwrap_or(false)
 }
 
 #[async_recursion]
-async fn init_dir_v2(original_path: PathBuf) -> Result<Dir> {
-    // Normalize Windows path to support extended length paths
+async fn init_dir(original_path: PathBuf) -> Result<Dir> {
     #[cfg(target_os = "windows")]
     fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
         let p_str = p.display().to_string();
@@ -143,42 +103,41 @@ async fn init_dir_v2(original_path: PathBuf) -> Result<Dir> {
     }
 
     let path = normalize_path(&original_path);
-    // rest of the function uses `path` variable
 
-    // let path = dir.path.clone();
+    if should_skip(&original_path) {
+        debug!("跳过系统目录: {}", original_path.display());
+        return Ok(Dir::new(path));
+    }
+
     if path.is_dir() {
-        let mut read_dir = read_dir(path.as_path())
-            .await
-            .context(anyhow!("读取文件夹[{}]失败", path.as_path().display()))?;
-        let name = path
-            .file_name()
-            .unwrap_or_else(|| path.as_os_str())
-            .to_os_string();
-        let mut dir = Dir::new(name, path.clone());
+        let read_dir_result = read_dir(path.as_path()).await;
+        let mut read_dir = match read_dir_result {
+            Ok(rd) => rd,
+            Err(e) if e.raw_os_error() == Some(5) => {
+                debug!("无权限访问, 跳过: {}", path.display());
+                return Ok(Dir::new(path));
+            }
+            Err(e) => {
+                return Err(anyhow!("读取文件夹[{}]失败: {}", path.display(), e));
+            }
+        };
+        let mut dir = Dir::new(path.clone());
         let mut dir_res = Vec::default();
         while let Ok(Some(sub_dir)) = read_dir.next_entry().await {
-            // println!("{:?} {} {:?}", sub_dir.file_name(), sub_dir.metadata().await?.is_dir(), sub_dir.path());
             if let Ok(metadata) = sub_dir.metadata().await {
                 if metadata.is_file() {
                     dir.size += metadata.len();
-                    // dir.files.push(File {
-                    //     name: sub_dir.file_name(), path: sub_dir.path(), size: metadata.len()
-                    // })
                 } else if metadata.is_dir() {
-                    // let sub_dir = Dir::new(
-                    //     sub_dir.file_name(),
-                    //     sub_dir.path(),);
-                    // dbg!("{:?}", sub_dir.path());
                     dir_res.push(tokio::spawn(
-                        async move { init_dir_v2(sub_dir.path()).await },
+                        async move { init_dir(sub_dir.path()).await },
                     ));
                 }
             } else {
-                warn!("读取文件[{}]metadata失败", sub_dir.path().display());
+                debug!("读取文件[{}]metadata失败", sub_dir.path().display());
             }
         }
         for sub_res in dir_res.into_iter() {
-            match sub_res.await.context(anyhow!("等待异常"))? {
+            match sub_res.await.map_err(|e| anyhow!("等待异常: {}", e))? {
                 Ok(res) => {
                     if res.size > 0 {
                         dir.add_size(res.size);
@@ -186,7 +145,7 @@ async fn init_dir_v2(original_path: PathBuf) -> Result<Dir> {
                     }
                 }
                 Err(e) => {
-                    warn!("{:?}", e);
+                    debug!("{:?}", e);
                 }
             }
         }
@@ -197,80 +156,24 @@ async fn init_dir_v2(original_path: PathBuf) -> Result<Dir> {
 }
 
 #[derive(Debug)]
-struct File {
-    name: OsString,
-    path: PathBuf,
-    size: u64,
-    m_size: u64,
-}
-#[derive(Debug)]
 struct Dir {
-    name: OsString,
     path: PathBuf,
-    files: Vec<File>,
     dirs: Vec<Dir>,
     size: u64,
-    m_size: u64,
     g_size: u64,
 }
 
-impl File {
-    pub fn new(name: impl Into<OsString>, path: impl Into<PathBuf>, size: u64) -> Self {
-        let m_size = size / M_SIZE;
-        Self {
-            name: name.into(),
-            path: path.into(),
-            size,
-            m_size,
-        }
-    }
-    #[inline]
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    #[inline]
-    pub fn m_size(&self) -> u64 {
-        self.m_size
-    }
-}
 impl Dir {
-    pub fn new(name: impl Into<OsString>, path: impl Into<PathBuf>) -> Self {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
-            name: name.into(),
             path: path.into(),
-            files: Vec::default(),
             dirs: Vec::default(),
             size: 0,
-            m_size: 0,
             g_size: 0,
         }
     }
     pub fn add_size(&mut self, size: u64) {
         self.size += size;
-        self.m_size = self.size / M_SIZE;
         self.g_size = self.size / G_SIZE;
     }
-    #[inline]
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    #[inline]
-    pub fn m_size(&self) -> u64 {
-        self.m_size
-    }
-    #[inline]
-    pub fn g_size(&self) -> u64 {
-        self.g_size
-    }
-}
-
-#[test]
-fn test() {
-    let path = PathBuf::from("C:\\Windows\\System32\\sru");
-    let metadata = path.metadata().unwrap();
-    println!(
-        "{} {:?}",
-        metadata.file_attributes(),
-        metadata.permissions()
-    );
 }
